@@ -24,14 +24,21 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
 // ---------- Settings ----------
 const unsigned int SCR_WIDTH = 1280;
 const unsigned int SCR_HEIGHT = 720;
+const float PLAYER_JUMP_SPEED = 5.0f;
+const float PLAYER_GRAVITY = -9.8f * 2.0f; // stronger gravity for snappier jump
 
 // ---------- Player / Camera ----------
 struct Player {
     glm::vec3 pos{ 0.0f, 0.0f, 0.0f };
     float yawDeg = 0.0f;          // หมุนตัวละครรอบแกน Y
-    float moveSpeed = 3.4f;       // m/s
+    float moveSpeed = 3.4f;       // m/s (walking)
+    float runSpeed = 6.0f;        // m/s (running)
     float rollSpeed = 2.0f;       // m/s
     float height = 1.1f;          // ความสูงศีรษะโดยประมาณ
+
+    // Jump state
+    bool isGrounded = true;
+    float yVelocity = 0.0f;
 } player;
 
 // กล้องแบบ third-person orbit (เมาส์หัน)
@@ -60,9 +67,11 @@ double lastY = SCR_HEIGHT / 2.0;
 // ---------- Input edges ----------
 bool prevLMB = false;
 bool prevSpace = false;
+bool prevE = false; // jump key edge
+bool prevShift = false; // run key edge
 
 // ---------- Animation State ----------
-enum class ActionState { Idle, Moving, Rolling, Attacking };
+enum class ActionState { Idle, Moving, Running, Rolling, Attacking, Jumping };
 ActionState state = ActionState::Idle;
 float actionTimeLeft = 0.0f;
 
@@ -70,7 +79,7 @@ float actionTimeLeft = 0.0f;
 Shader* gShader = nullptr;
 Model* gModel = nullptr;
 
-Animation* gIdle = nullptr, * gWalk = nullptr, * gRoll = nullptr, * gAttack = nullptr;
+Animation* gIdle = nullptr, * gWalk = nullptr, * gRun = nullptr, * gRoll = nullptr, * gAttack = nullptr, * gJump = nullptr;
 Animator* gAnimator = nullptr;
 
 // Ground geometry
@@ -191,13 +200,20 @@ int main() {
 
     Animation idleAnim(FileSystem::getPath("resources/objects/models/idle.dae"), &ourModel);
     Animation walkAnim(FileSystem::getPath("resources/objects/models/walk.dae"), &ourModel);
+    Animation walkBackwardAnim(FileSystem::getPath("resources/objects/models/walk_backward.dae"), &ourModel);
+    Animation runAnim(FileSystem::getPath("resources/objects/models/run.dae"), &ourModel);
+    Animation strafeLeftAnim(FileSystem::getPath("resources/objects/models/strafe_left.dae"), &ourModel);
+    Animation strafeRightAnim(FileSystem::getPath("resources/objects/models/strafe_right.dae"), &ourModel);
     Animation rollAnim(FileSystem::getPath("resources/objects/models/roll.dae"), &ourModel);
     Animation attackAnim(FileSystem::getPath("resources/objects/models/attack.dae"), &ourModel);
+    Animation jumpAnim(FileSystem::getPath("resources/objects/models/jump.dae"), &ourModel);
 
     gIdle = &idleAnim;
     gWalk = &walkAnim;
+    gRun = &runAnim;
     gRoll = &rollAnim;
     gAttack = &attackAnim;
+    gJump = &jumpAnim;
 
     Animator animator(gIdle);
     gAnimator = &animator;
@@ -223,32 +239,83 @@ int main() {
         // edge buttons
         bool spaceNow = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
         bool lmbNow = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
+        bool eNow = (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS); // jump key
+        bool shiftNow = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS); // run/sprint key
 
         // ===== STATE MACHINE =====
         if (state == ActionState::Rolling || state == ActionState::Attacking) {
             actionTimeLeft -= deltaTime;
             if (actionTimeLeft <= 0.0f) {
                 if (glm::length(moveInput) > 0.0f) {
-                    state = ActionState::Moving; PlayLoop(gWalk);
+                    if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
+                    else { state = ActionState::Moving; PlayLoop(gWalk); }
                 }
-                else {
+                else {                          
                     state = ActionState::Idle;   PlayLoop(gIdle);
                 }
             }
         }
+        else if (state == ActionState::Jumping)
+        {
+            // landing handled by gravity block below; keep playing jump until landed
+            if (player.isGrounded)
+            {
+                // landed this frame
+                if (glm::length(moveInput) > 0.0f) { 
+                    if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
+                    else { state = ActionState::Moving; PlayLoop(gWalk); }
+                }
+                else { state = ActionState::Idle; PlayLoop(gIdle); }
+            }
+        }
         else {
-            if (spaceNow && !prevSpace) {
+            if (eNow && !prevE && player.isGrounded) {
+                // start jump
+                state = ActionState::Jumping;
+                PlayOneShot(gJump, actionTimeLeft);
+                player.yVelocity = PLAYER_JUMP_SPEED;
+                player.isGrounded = false;
+            }
+            else if (spaceNow && !prevSpace) {
                 state = ActionState::Rolling;  PlayOneShot(gRoll, actionTimeLeft);
             }
             else if (lmbNow && !prevLMB) {
                 state = ActionState::Attacking; PlayOneShot(gAttack, actionTimeLeft);
             }
             else {
+                // If moving and holding shift -> running
                 if (glm::length(moveInput) > 0.0f) {
-                    if (state != ActionState::Moving) { state = ActionState::Moving; PlayLoop(gWalk); }
+                    if (shiftNow) {
+                        if (state != ActionState::Running) { state = ActionState::Running; PlayLoop(gRun); }
+                    }
+                    else {
+                        if (state != ActionState::Moving) { state = ActionState::Moving; PlayLoop(gWalk); }
+                    }
                 }
                 else {
                     if (state != ActionState::Idle) { state = ActionState::Idle;   PlayLoop(gIdle); }
+                }
+            }
+        }
+
+        // ===== GRAVITY / JUMP =====
+        if (!player.isGrounded)
+        {
+            player.yVelocity += PLAYER_GRAVITY * deltaTime;
+            player.pos.y += player.yVelocity * deltaTime;
+
+            if (player.pos.y <= 0.0f)
+            {
+                player.pos.y = 0.0f;
+                player.yVelocity = 0.0f;
+                player.isGrounded = true;
+                // state change will be handled at top of loop on next frame (or you can force here)
+                if (state == ActionState::Jumping) {
+                    if (glm::length(moveInput) > 0.0f) { 
+                        if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
+                        else { state = ActionState::Moving; PlayLoop(gWalk); }
+                    }
+                    else { state = ActionState::Idle; PlayLoop(gIdle); }
                 }
             }
         }
@@ -259,8 +326,13 @@ int main() {
         glm::vec3 wishDir = glm::normalize(camF * moveInput.y + camR * moveInput.x);
         if (glm::any(glm::isnan(wishDir))) wishDir = glm::vec3(0);
 
-        if (state == ActionState::Moving || state == ActionState::Idle) {
-            float spd = (state == ActionState::Moving ? player.moveSpeed : 0.0f);
+        if (state == ActionState::Moving || state == ActionState::Idle || state == ActionState::Jumping || state == ActionState::Running) {
+            float spd = 0.0f;
+            if (state == ActionState::Moving) spd = player.moveSpeed;
+            else if (state == ActionState::Running) spd = player.runSpeed;
+            else spd = 0.0f;
+            // allow limited air-control while jumping
+            if (state == ActionState::Jumping) spd *= 0.6f;
             player.pos += wishDir * spd * deltaTime;
 
             if (glm::length(wishDir) > 0.0f) {
@@ -276,6 +348,8 @@ int main() {
 
         prevSpace = spaceNow;
         prevLMB = lmbNow;
+        prevE = eNow;
+        prevShift = shiftNow;
 
         // ===== ANIMATION STEP =====
         gAnimator->UpdateAnimation(deltaTime);
