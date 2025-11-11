@@ -1,4 +1,5 @@
-﻿#include <glad/glad.h>
+﻿// main.cpp  (merged: movement + ground + safe texture binding)
+#include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
 #include <glm/glm.hpp>
@@ -34,7 +35,7 @@ struct Player {
     float moveSpeed = 3.4f;       // m/s (walking)
     float runSpeed = 6.0f;        // m/s (running)
     float rollSpeed = 2.0f;       // m/s
-    float height = 1.1f;          // ความสูงศีรษะโดยประมาณ
+    float height = 1.0f;          // ความสูงศีรษะโดยประมาณ
 
     // Jump state
     bool isGrounded = true;
@@ -54,6 +55,23 @@ struct OrbitCam {
     float minDist = 1.6f;    // อนุญาตให้ซูมใกล้มากขึ้น
     float maxDist = 6.0f;
 } cam;
+
+struct Hitbox {
+    glm::vec3 center; // world-space center
+    glm::vec3 halfExtents; // ครึ่งขนาดแต่ละแกน
+    bool visible = true; // debug draw
+
+    // ตรวจสอบการชนแบบ AABB กับ hitbox อื่น
+    bool intersects(const Hitbox& other) const {
+        return std::abs(center.x - other.center.x) <= (halfExtents.x + other.halfExtents.x) &&
+            std::abs(center.y - other.center.y) <= (halfExtents.y + other.halfExtents.y) &&
+            std::abs(center.z - other.center.z) <= (halfExtents.z + other.halfExtents.z);
+    }
+};
+
+Hitbox playerHitbox;
+GLuint hitboxVAO = 0, hitboxVBO = 0, hitboxEBO = 0;
+Shader* hitboxShader = nullptr;
 
 // ---------- Timing ----------
 float deltaTime = 0.0f;
@@ -84,6 +102,7 @@ Animator* gAnimator = nullptr;
 
 // Ground geometry
 GLuint groundVAO = 0, groundVBO = 0, groundEBO = 0;
+unsigned int groundTex = 0; // id for ground texture
 
 // ----- helpers -----
 static inline float radiansf(float d) { return d * 0.017453292519943295f; }
@@ -163,6 +182,92 @@ void CreateGround() {
     glBindVertexArray(0);
 }
 
+// load a 2D texture from path and return GL id (0 on fail)
+unsigned int LoadTexture(const std::string& path) {
+    int width, height, nrChannels;
+    // stbi flip already set in main
+    unsigned char* data = stbi_load(path.c_str(), &width, &height, &nrChannels, 0);
+    if (!data) {
+        std::cout << "Failed to load texture: " << path << "\n";
+        return 0;
+    }
+
+    GLenum format = GL_RGB;
+    if (nrChannels == 1) format = GL_RED;
+    else if (nrChannels == 3) format = GL_RGB;
+    else if (nrChannels == 4) format = GL_RGBA;
+
+    unsigned int tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    stbi_image_free(data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+void CreateHitboxMesh() {
+    float verts[] = {
+        // 8 corner points of unit cube centered at origin
+        -0.5f,-0.5f,-0.5f,  0.5f,-0.5f,-0.5f,  0.5f,0.5f,-0.5f,  -0.5f,0.5f,-0.5f,
+        -0.5f,-0.5f,0.5f,   0.5f,-0.5f,0.5f,   0.5f,0.5f,0.5f,   -0.5f,0.5f,0.5f
+    };
+    unsigned int idx[] = {
+        0,1, 1,2, 2,3, 3,0, // bottom
+        4,5, 5,6, 6,7, 7,4, // top
+        0,4, 1,5, 2,6, 3,7  // sides
+    };
+
+    glGenVertexArrays(1, &hitboxVAO);
+    glGenBuffers(1, &hitboxVBO);
+    glGenBuffers(1, &hitboxEBO);
+
+    glBindVertexArray(hitboxVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, hitboxVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, hitboxEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+
+    glBindVertexArray(0);
+}
+
+
+void DrawHitbox(Hitbox& hb) {
+    if (!hb.visible) return;
+
+    hitboxShader->use();
+
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::translate(model, hb.center);
+    model = glm::scale(model, hb.halfExtents * 2.0f);
+
+    glm::mat4 projection = glm::perspective(glm::radians(50.0f),
+        (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 300.0f);
+    glm::vec3 camPos; glm::mat4 view;
+    ComputeCamera(camPos, view);
+
+    hitboxShader->setMat4("projection", projection);
+    hitboxShader->setMat4("view", view);
+    hitboxShader->setMat4("model", model);
+
+    glBindVertexArray(hitboxVAO);
+    glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, 0);
+    glBindVertexArray(0);
+}
+
 int main() {
     // ---- GLFW/GL setup ----
     glfwInit();
@@ -187,12 +292,20 @@ int main() {
         return -1;
     }
 
+    // Flip once globally for stb (match your model textures / UVs)
     stbi_set_flip_vertically_on_load(true);
     glEnable(GL_DEPTH_TEST);
 
     // ---- Shaders ----
     Shader ourShader("anim_model.vs", "anim_model.fs");
     gShader = &ourShader;
+
+    // หลังจาก gShader โหลดเสร็จ
+    hitboxShader = new Shader(
+        "hitbox.vs", // vertex shader
+        "hitbox.fs"  // fragment shader
+    );
+    std::cout << FileSystem::getPath("anim_model.fs") << "\n";
 
     // ---- Load Model & Animations ----
     Model  ourModel(FileSystem::getPath("resources/objects/models/idle.dae"));
@@ -221,27 +334,47 @@ int main() {
     // ---- Ground ----
     CreateGround();
 
+    // ---- Load ground texture (change path if needed) ----
+    std::string groundTexPath = FileSystem::getPath("resources/objects/models/textures/ground.png");
+    groundTex = LoadTexture(groundTexPath);
+    if (groundTex == 0) {
+        std::cout << "Warning: ground texture not loaded, ground will still draw with shader default.\n";
+    }
+
+    // NOTE:
+    // We DO NOT forcibly set a global sampler name like "diffuseTexture" (which caused issues).
+    // For drawing the ground we will set the sampler that your fragment shader expects:
+    // Your anim_model.fs uses: uniform sampler2D texture_diffuse1;
+    // We'll set that before drawing the ground only (Model::Draw is expected to set its own sampler uniforms).
+
+    // toggle hitbox ก่อน main loop
+    CreateHitboxMesh();
+    bool showHitbox = true;
+
     // -------- Main loop --------
     while (!glfwWindowShouldClose(window)) {
-        // timing
+        // --- timing ---
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
-        // ===== INPUT =====
-        // WASD เดินตาม “ทิศกล้อง”
+        // --- input ---
         glm::vec2 moveInput(0.0f);
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) moveInput.y += 1.0f;
         if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) moveInput.y -= 1.0f;
         if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) moveInput.x += 1.0f;
         if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) moveInput.x -= 1.0f;
 
-        // edge buttons
-        bool spaceNow = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
-        bool lmbNow = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
-        bool eNow = (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS); // jump key
-        bool shiftNow = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS); // run/sprint key
+        bool spaceNow = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+        bool lmbNow = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        bool eNow = glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
+        bool shiftNow = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
 
+        // toggle hitbox with H (edge detect)
+        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !prevLMB) showHitbox = !showHitbox;
+        prevLMB = (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS);
+
+        // --- update player state, gravity, movement ---
         // ===== STATE MACHINE =====
         if (state == ActionState::Rolling || state == ActionState::Attacking) {
             actionTimeLeft -= deltaTime;
@@ -250,7 +383,7 @@ int main() {
                     if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
                     else { state = ActionState::Moving; PlayLoop(gWalk); }
                 }
-                else {                          
+                else {
                     state = ActionState::Idle;   PlayLoop(gIdle);
                 }
             }
@@ -261,7 +394,7 @@ int main() {
             if (player.isGrounded)
             {
                 // landed this frame
-                if (glm::length(moveInput) > 0.0f) { 
+                if (glm::length(moveInput) > 0.0f) {
                     if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
                     else { state = ActionState::Moving; PlayLoop(gWalk); }
                 }
@@ -309,9 +442,9 @@ int main() {
                 player.pos.y = 0.0f;
                 player.yVelocity = 0.0f;
                 player.isGrounded = true;
-                // state change will be handled at top of loop on next frame (or you can force here)
+                // state change handled at top of loop (or force here)
                 if (state == ActionState::Jumping) {
-                    if (glm::length(moveInput) > 0.0f) { 
+                    if (glm::length(moveInput) > 0.0f) {
                         if (shiftNow) { state = ActionState::Running; PlayLoop(gRun); }
                         else { state = ActionState::Moving; PlayLoop(gWalk); }
                     }
@@ -323,8 +456,11 @@ int main() {
         // ===== MOVEMENT =====
         glm::vec3 camF = CameraForward();
         glm::vec3 camR = CameraRight();
-        glm::vec3 wishDir = glm::normalize(camF * moveInput.y + camR * moveInput.x);
-        if (glm::any(glm::isnan(wishDir))) wishDir = glm::vec3(0);
+        glm::vec3 wishDir = glm::vec3(0.0f);
+        if (glm::length(moveInput) > 1e-6f) {
+            wishDir = glm::normalize(camF * moveInput.y + camR * moveInput.x);
+            if (glm::any(glm::isnan(wishDir))) wishDir = glm::vec3(0);
+        }
 
         if (state == ActionState::Moving || state == ActionState::Idle || state == ActionState::Jumping || state == ActionState::Running) {
             float spd = 0.0f;
@@ -351,14 +487,16 @@ int main() {
         prevE = eNow;
         prevShift = shiftNow;
 
-        // ===== ANIMATION STEP =====
+        playerHitbox.center = player.pos + glm::vec3(0, player.height / 1.2 5f, 0);
+        playerHitbox.halfExtents = glm::vec3(0.3f, player.height, 0.3f);
+
+
+        // --- animation update ---
         gAnimator->UpdateAnimation(deltaTime);
 
-        // ===== RENDER =====
+        // --- RENDER ---
         glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        gShader->use();
 
         // camera/projection
         glm::mat4 projection = glm::perspective(glm::radians(50.0f),
@@ -366,33 +504,74 @@ int main() {
         glm::vec3 camPos; glm::mat4 view;
         ComputeCamera(camPos, view);
 
+        // ----- draw ground -----
+        gShader->use();
+        gShader->setMat4("projection", projection);
+        gShader->setMat4("view", view);
+        glm::mat4 groundModel = glm::mat4(1.0f);
+        gShader->setMat4("model", groundModel);
+
+        if (groundTex != 0) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, groundTex);
+            gShader->setInt("texture_diffuse1", 0);
+        }
+
+        glBindVertexArray(groundVAO);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+
+        // ----- draw hitbox -----
+        if (showHitbox) {
+            hitboxShader->use();
+            glDisable(GL_DEPTH_TEST);
+            glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, 0);
+            glEnable(GL_DEPTH_TEST);
+
+            glm::mat4 hbModel = glm::mat4(1.0f);
+            hbModel = glm::translate(hbModel, playerHitbox.center);
+            hbModel = glm::scale(hbModel, playerHitbox.halfExtents * 2.0f);
+
+            hitboxShader->setMat4("model", hbModel);
+            hitboxShader->setMat4("view", view);
+            hitboxShader->setMat4("projection", projection);
+
+            glBindVertexArray(hitboxVAO);
+            glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+
+            glEnable(GL_DEPTH_TEST);
+        }
+
+
+        // ----- draw character -----
+        gShader->use(); // ✅ สำคัญ! ต้องเรียก shader ของโมเดลอีกครั้ง
         gShader->setMat4("projection", projection);
         gShader->setMat4("view", view);
 
         // bone matrices
         auto transforms = gAnimator->GetFinalBoneMatrices();
-        for (int i = 0; i < (int)transforms.size(); ++i) {
+        for (int i = 0; i < (int)transforms.size(); ++i)
             gShader->setMat4("finalBonesMatrices[" + std::to_string(i) + "]", transforms[i]);
-        }
 
-        // ----- draw ground (ใช้ shader เดิม: ให้เป็นวัตถุเรียบ) -----
         glm::mat4 model = glm::mat4(1.0f);
-        gShader->setMat4("model", model);
-        glBindVertexArray(groundVAO);
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-        glBindVertexArray(0);
-
-        // ----- draw character -----
-        model = glm::mat4(1.0f);
-        model = glm::translate(model, player.pos + glm::vec3(0.0f, -0.15f, 0.0f));
+        model = glm::translate(model, player.pos);
         model = glm::rotate(model, radiansf(player.yawDeg), glm::vec3(0, 1, 0));
-        model = glm::scale(model, glm::vec3(1.0f));
+        model = glm::scale(model, glm::vec3(1.0f)); // ใช้ scale 1.0f
         gShader->setMat4("model", model);
+
         gModel->Draw(*gShader);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+
+
+    // cleanup
+    if (groundTex) glDeleteTextures(1, &groundTex);
+    if (groundVAO) { glDeleteVertexArrays(1, &groundVAO); glDeleteBuffers(1, &groundVBO); glDeleteBuffers(1, &groundEBO); }
 
     glfwTerminate();
     return 0;
