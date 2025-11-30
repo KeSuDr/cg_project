@@ -17,6 +17,7 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -34,11 +35,11 @@ const float PLAYER_GRAVITY = -9.8f * 2.0f; // stronger gravity for snappier jump
 
 // ---------- Player / Camera ----------
 struct Hitbox {
-    glm::vec3 center; // world-space center
-    glm::vec3 halfExtents; // ครึ่งขนาดแต่ละแกน
+    glm::vec3 center{0.0f, 0.0f, 0.0f};    // world-space center — initialized to avoid C26495
+    glm::vec3 halfExtents{0.5f, 0.5f, 0.5f}; // default half extents to avoid C26495
     bool visible = true; // debug draw
 
-    // ตรวจสอบการชนแบบ AABB กับ hitbox อื่น
+    // AABB intersection with another hitbox
     bool intersects(const Hitbox& other) const {
         return std::abs(center.x - other.center.x) <= (halfExtents.x + other.halfExtents.x) &&
             std::abs(center.y - other.center.y) <= (halfExtents.y + other.halfExtents.y) &&
@@ -225,8 +226,8 @@ float potionCooldownTimer = 0.0f;  // ตัวนับ cooldown
 bool  prevR = false; // สำหรับตรวจ edge กดปุ่ม R
 
 // ---------- Timing ----------
+double lastFrame = 0.0;   // keep high precision for time measurement
 float deltaTime = 0.0f;
-float lastFrame = 0.0f;
 
 // ---------- Mouse state ----------
 bool firstMouse = true;
@@ -328,10 +329,21 @@ void DrawRect(float x, float y, float w, float h, glm::vec3 color)
 
     glBindVertexArray(0);
 }
+void DrawTextUI(const char* text, float x, float y, float size, glm::vec3 color);
+// Helper: draw text centered inside a rectangle (boxX,boxY = bottom-left)
+void DrawTextCenteredInBox(const char* text, float boxX, float boxY, float boxW, float boxH, float size, glm::vec3 color) {
+    // simple strlen (avoid adding headers)
+    int len = 0; while (text[len]) ++len;
+    float spacing = size * 0.8f;            // same spacing used by DrawTextUI
+    float textWidth = (len > 0) ? spacing * len - (spacing - size * 0.6f) : 0.0f; // approximate actual glyph width
+    float textHeight = size;
+    float tx = boxX + (boxW - textWidth) * 0.5f;
+    float ty = boxY + (boxH - textHeight) * 0.5f;
+    DrawTextUI(text, tx, ty, size, color);
+}
 
 
-
-// เวกเตอร์ forward/right “ตามกล้อง” (ใช้กับ WASD)
+// เวกเตอร๋ forward/right “ตามกล้อง” (ใช้กับ WASD)
 glm::vec3 CameraForward() {
     float yaw = radiansf(cam.yawDeg);
     float pit = radiansf(cam.pitchDeg);
@@ -482,6 +494,73 @@ void DrawHitbox(Hitbox& hb) {
     glBindVertexArray(0);
 }
 
+// --- Game state enum and globals (safe additions) ---
+enum class GameState { Menu, Playing, GameOver, Victory };
+GameState gGameState = GameState::Menu;
+bool gPrevEnter = false;
+bool gPrintedMenuMsg = false;
+bool gPrintedGameOverMsg = false;
+bool gPrintedVictoryMsg = false;
+
+// Reset helper: restores gameplay state without touching GL resources like groundVAO
+void ResetGame()
+{
+    // player
+    player.pos = glm::vec3(0.0f, 0.0f, 0.0f);
+    player.yawDeg = 0.0f;
+    player.isGrounded = true;
+    player.yVelocity = 0.0f;
+
+    // HP
+    playerHP.maxHP = 100.0f;
+    playerHP.currentHP = 100.0f;
+    boss.hp.maxHP = 1000.0f;
+    boss.hp.currentHP = 1000.0f;
+
+    // boss
+    boss.pos = player.pos + glm::vec3(0.0f, 0.0f, 12.0f);
+    boss.yawDeg = 180.0f;
+    boss.moveSpeed = 2.0f;
+    boss.state = BossState::Idle;
+    boss.bodyHitbox.visible = true;
+
+    // reset boss attack runtime and cooldowns so it won't immediately re-hit player
+    boss.attack = boss.punchTemplate;
+    boss.attack.active = false;
+    boss.attack.time = 0.0f;
+    boss.attack.hasHit = false;
+    boss.attack.windingUp = false;
+    boss.attack.windupTimer = 0.0f;
+    boss.attack.animStarted = false;
+    boss.attack.cooldownTimer = 0.0f;
+    boss.punchCdTimer = 1.0f;   // small grace period after reset
+    boss.heavyCdTimer = 1.0f;
+    bossAttackHitbox.visible = false;
+
+    // attacks & hitboxes
+    playerAttackHitbox.visible = false;
+    pCurrentAttack = nullptr;
+    playerAttackHasHit = false;
+
+    // animation & state
+    state = ActionState::Idle;
+    actionTimeLeft = 0.0f;
+    gPlayerAnimSpeed = 1.0f;
+    if (gAnimator && gIdle) PlayLoop(gIdle);
+    if (gBossAnimator && gBossIdle) BossPlayLoop(gBossIdle);
+
+    // timers / flags
+    playerInvulnerable = false;
+    iframeTimer = 0.0f;
+    potionCooldownTimer = 0.0f;
+    playerPotions = playerMaxPotions;
+
+    // console flags
+    gPrintedMenuMsg = false;
+    gPrintedGameOverMsg = false;
+    gPrintedVictoryMsg = false;
+}
+
 int main() {
     // ---- GLFW/GL setup ----
     glfwInit();
@@ -581,6 +660,9 @@ int main() {
     gBossPunch = &bossPunchAnim;
     gBossHeavyAttack = &bossHeavyAttackAnim;
 
+	//for checking file path issues
+    /*std::cout << "CWD: " << std::filesystem::current_path() << "\n";
+    std::cout << "`ui.vs` exists? " << std::boolalpha << std::filesystem::exists("ui.vs") << "\n";*/
 
     // สมมติในโมเดลใช้ชื่อ bone แบบ mixamo
     std::string rightHandName = "mixamorig_RightHand";
@@ -618,6 +700,7 @@ int main() {
     // ตั้งค่าท่าโจมตีหลักของบอส
 // ตั้งค่าท่าโจมตีหลักของบอส
 // ----- Punch template -----
+// damage, range, duration, windup, cooldown ปรับตามต้องการ
     boss.punchTemplate.name = "Punch";
     boss.punchTemplate.damage = 20.0f;
 
@@ -644,6 +727,7 @@ int main() {
     boss.isHeavyAttack = false;
 
     // ----- Heavy Attack template (ทุบลงพื้น AOE) -----
+// แรงกว่า damage, ระยะ AoE, พักทำซ้ำ คูลดาวน์ นานกว่า
     boss.heavyTemplate.name = "HeavyAttack";
     boss.heavyTemplate.damage = 60.0f;    // ท่าหนัก แรงกว่าหมัด
 
@@ -703,8 +787,8 @@ int main() {
     // -------- Main loop --------
     while (!glfwWindowShouldClose(window)) {
         // --- timing ---
-        float currentFrame = glfwGetTime();
-        deltaTime = currentFrame - lastFrame;
+        double currentFrame = glfwGetTime();
+        deltaTime = static_cast<float>(currentFrame - lastFrame);
         lastFrame = currentFrame;
 
         // --- input ---
@@ -939,6 +1023,16 @@ int main() {
                     std::cout << "[Player] hit boss for "
                         << pCurrentAttack->damage
                         << " dmg. Boss HP = " << boss.hp.currentHP << "\n";
+
+                    // If boss died, enter Victory UI
+                    if (boss.hp.isDead() && gGameState != GameState::Victory) {
+                        gGameState = GameState::Victory;
+                        gPrintedVictoryMsg = false; // allow console message on entry
+                        // stop boss attacks/visibility
+                        bossAttackHitbox.visible = false;
+                        boss.state = BossState::Dead;
+                        std::cout << "Boss defeated! Switching to VICTORY state.\n";
+                    }
                 }
             }
 
@@ -975,7 +1069,6 @@ int main() {
 
         boss.heavyCdTimer -= deltaTime;
         if (boss.heavyCdTimer < 0.0f) boss.heavyCdTimer = 0.0f;
-
 
 
 
@@ -1107,6 +1200,13 @@ int main() {
                             std::cout << "[Boss] "
                                 << (boss.isHeavyAttack ? "HeavyAttack" : "Punch")
                                 << " hit player! Player HP = " << playerHP.currentHP << "\n";
+
+                            // Transition to GameOver when player dies
+                            if (playerHP.isDead() && gGameState != GameState::GameOver) {
+                                gGameState = GameState::GameOver;
+                                gPrintedGameOverMsg = false; // allow the game-over console message to print
+                                std::cout << "Player died. Switching to GAME OVER state.\n";
+                            }
                         }
                         else {
                             std::cout << "[I-FRAME] Player dodged boss "
@@ -1154,11 +1254,153 @@ int main() {
         glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // camera/projection
-        glm::mat4 projection = glm::perspective(glm::radians(50.0f),
-            (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 300.0f);
-        glm::vec3 camPos; glm::mat4 view;
-        ComputeCamera(camPos, view);
+        // ========== MENU STATE ==========
+    if (gGameState == GameState::Menu) {
+        if (!gPrintedMenuMsg) {
+            std::cout << "=== MAIN MENU ===\n";
+            std::cout << "Press ENTER to Start\n";
+            gPrintedMenuMsg = true;
+        }
+
+        // Check for ENTER key to start game
+        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+        if (enterNow && !gPrevEnter) {
+            // "TRY AGAIN" behavior: reset everything and start playing immediately
+            ResetGame();
+            gGameState = GameState::Playing;
+            std::cout << "Retrying: Reset game and starting...\n";
+        }
+        gPrevEnter = enterNow;
+
+        // Draw menu UI
+        glDisable(GL_DEPTH_TEST);
+        uiShader->use();
+        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+        uiShader->setMat4("projection", orthoProj);
+
+        // Dark overlay
+        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.02f, 0.02f, 0.03f));
+
+        // Title background
+        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.15f, 0.05f, 0.05f));
+        
+        // Game title text "DARK ARENA"
+        DrawTextCenteredInBox("DARK ARENA", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.7f, 0.2f));
+        
+        // "Press ENTER" box
+        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.1f, 0.15f));
+
+        // Pulsing effect for "Press ENTER"
+        float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 3.0f);
+        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.3f + pulse * 0.3f, 0.2f + pulse * 0.2f, 0.1f));
+        
+        // "START GAME" text
+        DrawTextCenteredInBox("START GAME", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
+
+        glEnable(GL_DEPTH_TEST);
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        continue; // Skip game logic
+    }
+
+    // ========== GAME OVER STATE ==========
+    if (gGameState == GameState::GameOver) {
+        if (!gPrintedGameOverMsg) {
+            std::cout << "=== GAME OVER ===\n";
+            std::cout << "Press ENTER to Return to Menu\n";
+            gPrintedGameOverMsg = true;
+        }
+
+        // ENTER to retry immediately (behave like START GAME)
+        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+        if (enterNow && !gPrevEnter) {
+            ResetGame();
+            gGameState = GameState::Playing;
+            std::cout << "Retrying: Reset game and starting...\n";
+        }
+        gPrevEnter = enterNow;
+
+        // Draw game over UI
+        glDisable(GL_DEPTH_TEST);
+        uiShader->use();
+        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+        uiShader->setMat4("projection", orthoProj);
+
+        // Dark red overlay
+        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.1f, 0.01f, 0.01f));
+
+        // Game Over title background
+        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.3f, 0.05f, 0.05f));
+        
+        // "GAME OVER" text
+        DrawTextCenteredInBox("GAME OVER", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.2f, 0.2f));
+
+        // "Press ENTER" box
+        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.15f, 0.05f, 0.05f));
+
+        // Pulsing effect
+        float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.0f);
+        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.4f + pulse * 0.2f, 0.1f, 0.1f));
+        
+        // "TRY AGAIN" text
+        DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
+
+        glEnable(GL_DEPTH_TEST);
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        continue; // Skip game logic
+    }
+
+    // ========== VICTORY STATE ==========
+    if (gGameState == GameState::Victory) {
+        if (!gPrintedVictoryMsg) {
+            std::cout << "=== VICTORY ===\n";
+            std::cout << "Press ENTER to Play Again\n";
+            gPrintedVictoryMsg = true;
+        }
+
+        // ENTER to restart immediately (same as START)
+        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+        if (enterNow && !gPrevEnter) {
+            ResetGame();
+            gGameState = GameState::Playing;
+            std::cout << "Restarting after victory...\n";
+        }
+        gPrevEnter = enterNow;
+
+        // Draw victory UI (greenish)
+        glDisable(GL_DEPTH_TEST);
+        uiShader->use();
+        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+        uiShader->setMat4("projection", orthoProj);
+
+        // Dark overlay tinted green
+        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.05f, 0.08f, 0.02f));
+
+        // Title background
+        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.07f, 0.20f, 0.05f));
+        // "VICTORY" text
+        DrawTextCenteredInBox("VICTORY", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.95f, 0.95f, 0.6f));
+
+        // "Press ENTER" box
+        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.16f, 0.08f));
+        // Pulsing effect
+        float pulseV = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.5f);
+        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.2f + pulseV * 0.2f, 0.25f + pulseV * 0.2f, 0.08f));
+        // "CONTINUE" text
+        DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.95f, 0.95f, 0.95f));
+
+        glEnable(GL_DEPTH_TEST);
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        continue; // Skip game logic
+    }
+
+    // camera/projection
+    glm::mat4 projection = glm::perspective(glm::radians(50.0f),
+        (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 300.0f);
+    glm::vec3 camPos; glm::mat4 view;
+    ComputeCamera(camPos, view);
 
         // ========== ใช้ gShader กับทุกอย่าง  ==========
         gShader->use();
@@ -1272,7 +1514,7 @@ int main() {
         glfwPollEvents();
     }   // <<< ปิด while (!glfwWindowShouldClose)
 
-
+    
 
     // cleanup
     if (groundTex) glDeleteTextures(1, &groundTex);
@@ -1307,3 +1549,155 @@ void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset)
     if (cam.distance < cam.minDist) cam.distance = cam.minDist;
     if (cam.distance > cam.maxDist) cam.distance = cam.maxDist;
 }
+
+void DrawLetter(float x, float y, float size, char letter, glm::vec3 color) {
+    float w = size * 0.6f;  // letter width
+    float h = size;         // letter height
+    float t = size * 0.15f; // thickness
+
+    // Draw small squares centered on the diagonal between two points
+    auto draw_centered_stepped_diagonal = [&](float sx, float sy, float ex, float ey, int steps) {
+        float stepSize = t * 0.9f;
+        for (int s = 0; s < steps; ++s) {
+            float u = (float)s / (float)(steps - 1);
+            float px = sx + (ex - sx) * u;
+            float py = sy + (ey - sy) * u;
+            // center the small rect on (px,py)
+            DrawRect(px - stepSize * 0.5f, py - stepSize * 0.5f, stepSize, stepSize, color);
+        }
+        };
+
+    switch (letter) {
+    case 'S':
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x, y + h / 2 - t / 2, w, t, color);
+        DrawRect(x, y, w, t, color);
+        DrawRect(x, y + h / 2, t, h / 2, color);
+        DrawRect(x + w - t, y, t, h / 2, color);
+        break;
+    case 'T':
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x + w / 2 - t / 2, y, t, h, color);
+        break;
+    case 'A':
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x, y, t, h, color);
+        DrawRect(x + w - t, y, t, h, color);
+        DrawRect(x, y + h / 2 - t / 2, w, t, color);
+        break;
+    case 'R':
+        DrawRect(x, y, t, h, color);                          // left stem
+        DrawRect(x, y + h - t, w, t, color);                  // top bar
+        DrawRect(x + w - t, y + h / 2, t, h / 2, color);      // top-right vertical
+        DrawRect(x, y + h / 2 - t / 2, w, t, color);          // middle bar
+        draw_centered_stepped_diagonal(x + w / 2, y + h / 2 - t / 2, x + w - t, y, 6); // diagonal leg
+        break;
+    case 'C':
+        // Upper bar (inset slightly from full width so C looks open)
+        DrawRect(x + t * 0.2f, y + h - t, w - t * 0.4f, t, color);
+        // Left vertical stem (full height minus small caps)
+        DrawRect(x, y + t, t, h - 2.0f * t, color);
+        // Lower bar (inset like the top)
+        DrawRect(x + t * 0.2f, y, w - t * 0.4f, t, color);
+        break;
+    case 'G':
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x, y, w, t, color);
+        DrawRect(x, y, t, h, color);
+        DrawRect(x + w - t, y, t, h, color);
+        DrawRect(x + w / 2, y + h / 2 - t / 2, w / 2, t, color);
+        break;
+    case 'M':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x + w - t, y, t, h, color);
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x + w / 2 - t / 2, y + h / 2, t, h / 2, color);
+        break;
+    case 'E':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x, y + h / 2 - t / 2, w * 0.8f, t, color);
+        DrawRect(x, y, w, t, color);
+        break;
+    case 'O':
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x, y, w, t, color);
+        DrawRect(x, y, t, h, color);
+        DrawRect(x + w - t, y, t, h, color);
+        break;
+    case 'V':
+        DrawRect(x, y + h / 2, t, h / 2, color);
+        DrawRect(x + w - t, y + h / 2, t, h / 2, color);
+        DrawRect(x + t, y + h / 4, t, h / 4, color);
+        DrawRect(x + w - 2 * t, y + h / 4, t, h / 4, color);
+        DrawRect(x + w / 2 - t / 2, y, t, h / 4, color);
+        break;
+    case 'P':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x, y + h - t, w, t, color);
+        DrawRect(x + w - t, y + h / 2, t, h / 2, color);
+        DrawRect(x, y + h / 2 - t / 2, w, t, color);
+        break;
+    case 'L':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x, y, w, t, color);
+        break;
+    case 'Y':
+        DrawRect(x, y + h / 2, t, h / 2, color);
+        DrawRect(x + w - t, y + h / 2, t, h / 2, color);
+        DrawRect(x + w / 2 - t / 2, y, t, h / 2, color);
+        break;
+    case 'N':
+        DrawRect(x, y, t, h, color);                      // left stem
+        DrawRect(x + w - t, y, t, h, color);              // right stem
+        // diagonal top-left -> bottom-right
+        draw_centered_stepped_diagonal(x + t * 0.5f, y + h - t * 0.5f, x + w - t * 0.5f, y + t * 0.5f, 12);
+        break;
+    case 'K':
+        DrawRect(x, y, t, h, color);                   // left stem
+        // Upper diagonal - from middle to top-right
+        DrawRect(x + t, y + h / 2 - t / 2, w / 3, t, color); // mid segment
+        DrawRect(x + w / 3, y + 2 * h / 3, w / 3, t, color);   // upper segment
+        // Lower diagonal - from middle to bottom-right
+        DrawRect(x + t, y + h / 2 - t / 2, w / 3, t, color); // mid segment (shared)
+        DrawRect(x + w / 3, y + h / 6, w / 3, t, color);     // lower segment
+        DrawRect(x + w - w / 4, y, t, h / 4, color);       // bottom tip
+        DrawRect(x + w - w / 4, y + 3 * h / 4, t, h / 4, color); // top tip
+        break;
+    case 'W':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x + w - t, y, t, h, color);
+        DrawRect(x, y, w, t, color);
+        DrawRect(x + w / 2 - t / 2, y, t, h / 2, color);
+        break;
+    case 'D':
+        DrawRect(x, y, t, h, color);
+        DrawRect(x, y + h - t, w * 0.7f, t, color);
+        DrawRect(x, y, w * 0.7f, t, color);
+        DrawRect(x + w * 0.7f, y + t, t, h - 2 * t, color);
+        break;
+    case 'I':
+        // Top cap
+        DrawRect(x, y + h - t, w, t, color);
+        // Bottom cap
+        DrawRect(x, y, w, t, color);
+        // Vertical stem centered
+        DrawRect(x + w / 2 - t / 2, y, t, h, color);
+        break;
+    case ' ':
+        break;
+    default:
+        break;
+    }
+}
+void DrawTextUI(const char* text, float x, float y, float size, glm::vec3 color) {
+    float spacing = size * 0.8f;
+    float currentX = x;
+    
+    for(int i = 0; text[i] != '\0'; i++) {
+        DrawLetter(currentX, y, size, text[i], color);
+        currentX += spacing;
+    }
+}
+
+
