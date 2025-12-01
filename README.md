@@ -11,11 +11,12 @@ Features :
 
 Attack
 
-![cg4-ezgif com-video-to-gif-converter (1)](https://github.com/user-attachments/assets/0d01a9e5-6a9f-4e71-9a2e-085e4cf15ed6)
+![Attack-MadewithClipchamp-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/355a6764-b8b9-4c10-9a5a-2a0ce16ed7c3)
 
 Roll
 
-![cg4-ezgif com-video-to-gif-converter (2)](https://github.com/user-attachments/assets/c7c3f2bc-3b57-4d0b-aa98-41a3ab42d9ff)
+![Roll-MadewithClipchamp-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/81f10282-ded5-4804-b306-71681b287173)
+
 
 Screenshots:
 
