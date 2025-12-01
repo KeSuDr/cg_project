@@ -22,6 +22,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
 // ---------- Callbacks ----------
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void mouse_callback(GLFWwindow* window, double xpos, double ypos);
@@ -53,7 +56,7 @@ struct Player {
     float yawDeg = 0.0f;          // หมุนตัวละครรอบแกน Y
     float moveSpeed = 3.4f;       // m/s (walking)
     float runSpeed = 6.0f;        // m/s (running)
-    float rollSpeed = 1.0f;       // m/s
+    float rollSpeed = 3.0f;       // m/s
     float height = 1.0f;          // ความสูงศีรษะโดยประมาณ
 
     // Jump state
@@ -128,8 +131,8 @@ struct Boss {
     // คูลดาวน์แยกสำหรับ punch / jump
     float punchCdTimer = 0.0f;
     float heavyCdTimer = 0.0f;
-    float punchCd = 2.0f;  // ปรับได้
-    float heavyCd = 6.0f;  // คูลดาวน์ jump นานกว่า
+    float punchCd = 2.0f;
+    float heavyCd = 10.0f;
 
     Hitbox bodyHitbox;
 };
@@ -255,8 +258,10 @@ Shader* gShader = nullptr;
 Model* gModel = nullptr;
 Model* gBossModel = nullptr;
 
+Shader* gSwordShader = nullptr;   // << เพิ่มอันนี้
 Model* gSwordModel = nullptr;
 int gRightHandBoneIndex = -1;
+glm::mat4 gRightHandOffset;
 
 Animation* gIdle = nullptr, * gWalk = nullptr, * gRun = nullptr,
 * gRoll = nullptr, * gAttack = nullptr, * gJump = nullptr,
@@ -277,6 +282,141 @@ unsigned int groundTex = 0; // id for ground texture
 
 // ----- helpers -----
 static inline float radiansf(float d) { return d * 0.017453292519943295f; }
+
+// ===== Audio (miniaudio) =====
+ma_engine gAudioEngine;
+
+// เก็บ pointer ของ ma_sound ที่กำลังเล่นอยู่ เพื่อเคลียร์ทิ้งทีหลัง
+std::vector<ma_sound*> gActiveSounds;
+
+// เพลงประกอบ
+ma_sound gBgm;
+bool gBgmInit = false;
+
+
+
+// path ของไฟล์เสียงแต่ละอัน (อิงจาก FileSystem::getPath แบบเดียวกับ model)
+std::string gSfxPlayerSlash;
+std::string gSfxPlayerHeavy;
+std::string gSfxPlayerRoll;
+std::string gSfxPlayerJump;
+std::string gSfxPlayerPotion;
+
+std::string gSfxBossPunch;
+std::string gSfxBossHeavy;
+
+// init / shutdown audio
+bool InitAudio()
+{
+    if (ma_engine_init(NULL, &gAudioEngine) != MA_SUCCESS) {
+        std::cout << "Failed to init audio engine\n";
+        return false;
+    }
+
+    // ลด volume ทั้งเกมลงหน่อย (0.0 - 1.0) ถ้าอยากดังขึ้นค่อยปรับทีหลัง
+    ma_engine_set_volume(&gAudioEngine, 0.4f);
+
+    // ---------- BGM (optional) ----------
+    std::string bgmPath = FileSystem::getPath("resources/objects/models/bgm.mp3");
+    ma_result res = ma_sound_init_from_file(
+        &gAudioEngine,
+        bgmPath.c_str(),
+        MA_SOUND_FLAG_STREAM,    // stream จากไฟล์ (เพลงยาว)
+        NULL, NULL,
+        &gBgm
+    );
+    if (res == MA_SUCCESS) {
+        gBgmInit = true;
+        ma_sound_set_looping(&gBgm, MA_TRUE);
+        ma_sound_set_volume(&gBgm, 0.15f);   // ปรับความดังของเพลง
+               // ถ้าอยากให้เริ่มตอนเข้าเกม ให้ start ตรงนี้
+        // ถ้าอยากเริ่มเฉพาะตอนเข้า GameState::Playing ค่อยไป start ในตอนเปลี่ยน state แทน
+    }
+    else {
+        std::cout << "Failed to load BGM: " << bgmPath << "\n";
+    }
+
+    return true;
+}
+
+void ShutdownAudio()
+{
+    // เคลียร์เสียงเอฟเฟกต์ที่ยังค้างอยู่
+    for (ma_sound* s : gActiveSounds) {
+        ma_sound_uninit(s);
+        delete s;
+    }
+    gActiveSounds.clear();
+
+    if (gBgmInit) {
+        ma_sound_uninit(&gBgm);
+        gBgmInit = false;
+    }
+
+    ma_engine_uninit(&gAudioEngine);
+}
+
+
+// helper เล่นเสียงง่าย ๆ
+
+void PlaySfxDelayed(const std::string& path, float volume, float delaySec)
+{
+    if (path.empty()) return;
+
+    // สร้าง ma_sound ใหม่บน heap (อย่าบน stack)
+    ma_sound* sound = new ma_sound;
+
+    ma_result res = ma_sound_init_from_file(
+        &gAudioEngine,
+        path.c_str(),
+        0,          // flags (ถ้าอยาก stream ค่อยใส่ MA_SOUND_FLAG_STREAM)
+        NULL, NULL,
+        sound
+    );
+
+    if (res != MA_SUCCESS) {
+        std::cout << "Failed to init sfx: " << path << "\n";
+        delete sound;
+        return;
+    }
+
+    // ตั้ง volume สำหรับเสียงนี้ (0.0 - 1.0)
+    ma_sound_set_volume(sound, volume);
+
+    // แปลงวินาที -> frame โดยอิงเวลาปัจจุบันของ engine
+    ma_uint64 nowFrames = ma_engine_get_time_in_pcm_frames(&gAudioEngine);
+    ma_uint64 delayFrames = (ma_uint64)(delaySec * ma_engine_get_sample_rate(&gAudioEngine));
+
+    ma_sound_set_start_time_in_pcm_frames(sound, nowFrames + delayFrames);
+
+    // สั่งเริ่มเล่น (แต่จะเริ่มจริงตาม start_time ที่ตั้งไว้)
+    ma_sound_start(sound);
+
+    // เก็บ pointer ไว้ให้ main loop มาคอยเช็คว่าเล่นจบแล้วค่อยลบ
+    gActiveSounds.push_back(sound);
+}
+
+
+void UpdateSfxLifetime()
+{
+    for (auto it = gActiveSounds.begin(); it != gActiveSounds.end(); )
+    {
+        ma_sound* s = *it;
+
+        // ma_sound_at_end() จะ true เมื่อเล่นจบ (รวมถึงกรณีไม่ start ก็จะไม่เป็น true)
+        if (ma_sound_at_end(s)) {
+            ma_sound_uninit(s);
+            delete s;
+            it = gActiveSounds.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+
+
 
 
 // ----- Player helpers -----
@@ -440,6 +580,15 @@ unsigned int LoadTexture(const std::string& path) {
     return tex;
 }
 
+void SetIdentityBones(Shader* shader, size_t count)
+{
+    glm::mat4 I(1.0f);
+    for (size_t i = 0; i < count; ++i) {
+        shader->setMat4("finalBonesMatrices[" + std::to_string(i) + "]", I);
+    }
+}
+
+
 void CreateHitboxMesh() {
     float verts[] = {
         // 8 corner points of unit cube centered at origin
@@ -571,7 +720,7 @@ int main() {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Souls-like TPS (Mouse Camera)", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Dark Arena", NULL, NULL);
     if (!window) { std::cout << "Failed to create GLFW window\n"; glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -589,9 +738,24 @@ int main() {
     stbi_set_flip_vertically_on_load(true);
     glEnable(GL_DEPTH_TEST);
 
+    InitAudio();
+
+    // ตั้ง path ไฟล์เสียง (อยู่ในโฟลเดอร์เดียวกับโมเดล)
+    gSfxPlayerSlash = FileSystem::getPath("resources/objects/models/punch.mp3");
+    gSfxPlayerHeavy = FileSystem::getPath("resources/objects/models/heavypunch.mp3");
+    gSfxPlayerRoll = FileSystem::getPath("resources/objects/models/roll.mp3");
+    gSfxPlayerJump = FileSystem::getPath("resources/objects/models/roll.mp3");
+    gSfxPlayerPotion = FileSystem::getPath("resources/objects/models/drink.mp3");
+
+    gSfxBossPunch = FileSystem::getPath("resources/objects/models/heavypunch.mp3");
+    gSfxBossHeavy = FileSystem::getPath("resources/objects/models/heavy.mp3");
+
     // ---- Shaders ----
     Shader ourShader("anim_model.vs", "anim_model.fs");
     gShader = &ourShader;
+
+    Shader swordShader("sword.vs", "sword.fs");
+    gSwordShader = &swordShader;
 
     // หลังจาก gShader โหลดเสร็จ
     hitboxShader = new Shader(
@@ -611,6 +775,16 @@ int main() {
 
     Model swordModel(FileSystem::getPath("resources/objects/models/Sword_2.fbx"));
     gSwordModel = &swordModel;
+
+    // DEBUG: check path + file exists
+    std::string swordPath = FileSystem::getPath("resources/objects/models/Sword_2.fbx");
+    std::cout << "Sword path: " << swordPath << "\n";
+    std::cout << "Sword file exists? "
+        << std::boolalpha << std::filesystem::exists(swordPath) << "\n";
+
+    // DEBUG: check mesh count (ใน LearnOpenGL Model, meshes เป็น public)
+    std::cout << "Sword mesh count = " << gSwordModel->meshes.size() << "\n";
+
 
     Animation idleAnim(FileSystem::getPath("resources/objects/models/idle.dae"), &ourModel);
     Animation walkAnim(FileSystem::getPath("resources/objects/models/walk.dae"), &ourModel);
@@ -667,14 +841,17 @@ int main() {
     // สมมติในโมเดลใช้ชื่อ bone แบบ mixamo
     std::string rightHandName = "mixamorig_RightHand";
 
-    auto& boneInfoMap = gModel->GetBoneInfoMap(); // ฟังก์ชันนี้ต้องมีใน ModelAnimation ของนาย
-    if (boneInfoMap.find(rightHandName) != boneInfoMap.end()) {
-        gRightHandBoneIndex = boneInfoMap[rightHandName].id;   // หรือ .m_ID แล้วแต่ struct
-		std::cout << "Right hand bone index: " << gRightHandBoneIndex << "\n";
+    auto& boneInfoMap = gModel->GetBoneInfoMap();
+    auto it = boneInfoMap.find(rightHandName);
+    if (it != boneInfoMap.end()) {
+        gRightHandBoneIndex = it->second.id;
+        std::cout << "Right hand bone index: " << gRightHandBoneIndex << "\n";
     }
     else {
         std::cout << "Right hand bone not found!\n";
     }
+
+
 
     // default: boss idle animation
     Animator bossAnimator(gBossIdle);
@@ -693,7 +870,7 @@ int main() {
     BossPlayLoop(gBossIdle);  // ให้เล่น idle ชัด ๆ เลย
 
     // hitbox ตัวบอส
-    boss.bodyHitbox.halfExtents = glm::vec3(0.4f, 1.0f, 0.4f) * BOSS_SCALE;  // 👈 คูณ scale
+    boss.bodyHitbox.halfExtents = glm::vec3(0.5f, 1.0f, 0.4f) * BOSS_SCALE;  // 👈 คูณ scale
     boss.bodyHitbox.visible = true;
 
 
@@ -732,7 +909,7 @@ int main() {
     boss.heavyTemplate.damage = 60.0f;    // ท่าหนัก แรงกว่าหมัด
 
     // ระยะที่ถือว่าอยู่ในระยะใช้ท่านี้ (ใช้กับ AI เท่านั้น)
-    boss.heavyTemplate.range = 3.0f;
+    boss.heavyTemplate.range = boss.punchTemplate.range;
 
     // ไม่ต้อง “กระโดด” จริงแล้ว แต่ให้มีจังหวะง้างก่อนทุบ
     boss.heavyTemplate.windup = 0.6f;
@@ -761,8 +938,8 @@ int main() {
     pHeavy.damage = 25.0f;
     pHeavy.range = 1.0f;
     pHeavy.duration = 0.6f;
-    pHeavy.hitStart = 0.4f;
-    pHeavy.hitEnd = 0.8f;
+    pHeavy.hitStart = 0.95f;
+    pHeavy.hitEnd = 1.0f;
 
     // player attack hitbox default
     playerAttackHitbox.visible = false;
@@ -782,7 +959,7 @@ int main() {
 
     // toggle hitbox ก่อน main loop
     CreateHitboxMesh();
-    bool showHitbox = true;
+    bool showHitbox = false;
 
     // -------- Main loop --------
     while (!glfwWindowShouldClose(window)) {
@@ -821,6 +998,8 @@ int main() {
                 std::cout << "[Potion] Heal +" << potionHealAmount
                     << " HP, now = " << playerHP.currentHP
                     << ", potions left = " << playerPotions << "\n";
+
+                PlaySfxDelayed(gSfxPlayerPotion, 0.5f, 0.0f);
             }
         }
 
@@ -872,6 +1051,8 @@ int main() {
                 PlayOneShot(gJump, actionTimeLeft);
                 player.yVelocity = PLAYER_JUMP_SPEED;
                 player.isGrounded = false;
+
+                PlaySfxDelayed(gSfxPlayerJump, 0.5f, 0.0f);
             }
             else if (spaceNow && !prevSpace) {
                 state = ActionState::Rolling;
@@ -879,6 +1060,8 @@ int main() {
 
                 iframeTimer = 0.0f;
                 playerInvulnerable = false;   // จะเปิดหลังถึงเวลา ROLL_IFRAME_START
+
+                PlaySfxDelayed(gSfxPlayerRoll, 0.5f, 0.0f);
             }
 
             else if (lmbNow && !prevLMB) {
@@ -890,7 +1073,10 @@ int main() {
                 pCurrentAttack->active = true;
                 pCurrentAttack->time = 0.0f;
                 pCurrentAttack->hasHit = false;
+
+                PlaySfxDelayed(gSfxPlayerSlash, 0.5f, 0.0f);
             }
+
             else if (rmbNow && !prevRMB) {
                 // RMB = ท่าหนักเดิม (attack.dae)
                 state = ActionState::Attacking;
@@ -900,7 +1086,10 @@ int main() {
                 pCurrentAttack->active = true;
                 pCurrentAttack->time = 0.0f;
                 pCurrentAttack->hasHit = false;
+
+                PlaySfxDelayed(gSfxPlayerHeavy, 0.5f, 0.6f);
             }
+
             else {
                 // If moving and holding shift -> running
                 if (glm::length(moveInput) > 0.0f) {
@@ -1008,10 +1197,10 @@ int main() {
                 ));
 
                 playerAttackHitbox.center =
-                    player.pos + glm::vec3(0, player.height * 0.6f, 0)
+                    player.pos + glm::vec3(0, player.height * 1.0f, 0)
                     + fwd * pCurrentAttack->range;
 
-                playerAttackHitbox.halfExtents = glm::vec3(0.4f, 0.6f, 0.8f);
+                playerAttackHitbox.halfExtents = glm::vec3(0.5f, 1.0f, 0.6f);
                 playerAttackHitbox.visible = true;
 
                 if (!pCurrentAttack->hasHit &&
@@ -1099,50 +1288,61 @@ int main() {
                         boss.yawDeg = glm::degrees(std::atan2(toPlayer3.x, toPlayer3.z));
                     }
 
-                    // เดินเข้าไปจนกว่าจะถึงระยะแบบกว้างสุดของท่าที่มี
+                    // ===== 1) เดินเข้าไปหา player =====
                     float maxAttackRange = std::max(punchRange, heavyRange);
-                    bool canPunch = (dist <= punchRange && boss.punchCdTimer <= 0.0f);
-                    bool canHeavy = (dist > punchRange && dist <= heavyRange && boss.heavyCdTimer <= 0.0f);
+                    float desiredDist = maxAttackRange * 0.8f;  // ระยะที่อยากหยุดเพื่อเริ่มโจมตี
 
-                    if (!canPunch && !canHeavy) {
-                        // ทั้งสองท่าอยู่ในคูลดาวน์ → ยังไม่ทำอะไร
+                    if (dist > desiredDist) {
+                        // ยังไกลอยู่ → ขยับตำแหน่งเข้าไป
+                        glm::vec3 dir = glm::normalize(glm::vec3(toPlayer3.x, 0.0f, toPlayer3.z));
+                        boss.pos += dir * boss.moveSpeed * deltaTime;
                     }
                     else {
-                        bool useHeavy = false;
+                        // ===== 2) อยู่ในระยะโจมตีแล้ว → เลือกท่า =====
+                        bool inRange = (dist <= punchRange);   // หรือ <= heavyRange ก็เท่ากันอยู่แล้ว
 
-                        if (canHeavy && !canPunch)      useHeavy = true;
-                        else if (canPunch && !canHeavy) useHeavy = false;
-                        else {
-                            // ทั้งสองท่าใช้ได้ → สุ่มให้ heavy ประมาณ 40%
-                            int r = rand() % 100;
-                            useHeavy = (r < 40);
-                        }
+                        bool canPunch = (inRange && boss.punchCdTimer <= 0.0f);
+                        bool canHeavy = (inRange && boss.heavyCdTimer <= 0.0f);
 
-                        boss.isHeavyAttack = useHeavy;
-                        const AttackData& tpl = useHeavy ? boss.heavyTemplate : boss.punchTemplate;
-                        boss.attack = tpl;
-
-                        // init runtime
-                        boss.attack.active = true;
-                        boss.attack.time = 0.0f;
-                        boss.attack.hasHit = false;
-                        boss.attack.windingUp = true;
-                        boss.attack.windupTimer = boss.attack.windup;
-                        boss.attack.animStarted = false;
-
-                        if (useHeavy) {
-                            boss.heavyCdTimer = boss.heavyCd;
+                        if (!canPunch && !canHeavy) {
+                            // ทั้งสองท่าใช้ไม่ได้ (คูลดาวน์ไม่ครบ) → เดินไล่เฉย ๆ
                         }
                         else {
-                            boss.punchCdTimer = boss.punchCd;
-                        }
+                            bool useHeavy = false;
 
-                        boss.state = BossState::Attacking;
+                            if (canHeavy && !canPunch)      useHeavy = true;
+                            else if (canPunch && !canHeavy) useHeavy = false;
+                            else {
+                                // ทั้งสองท่าใช้ได้ → random เอา
+                                int r = rand() % 100;
+                                useHeavy = (r < 40);   // 40% ใช้ heavy, 60% ใช้ punch
+                            }
+
+                            boss.isHeavyAttack = useHeavy;
+                            const AttackData& tpl = useHeavy ? boss.heavyTemplate : boss.punchTemplate;
+                            boss.attack = tpl;
+
+                            boss.attack.active = true;
+                            boss.attack.time = 0.0f;
+                            boss.attack.hasHit = false;
+                            boss.attack.windingUp = true;
+                            boss.attack.windupTimer = boss.attack.windup;
+                            boss.attack.animStarted = false;
+
+                            if (useHeavy) {
+                                boss.heavyCdTimer = boss.heavyCd;  // ยังนานกว่า punch
+                            }
+                            else {
+                                boss.punchCdTimer = boss.punchCd;
+                            }
+
+                            boss.state = BossState::Attacking;
+                        }
                     }
                 }
-
                 break;
             }
+
             case BossState::Attacking: {
                 // ---------- ช่วง windup: รอก่อนชก ----------
                 if (boss.attack.windingUp) {
@@ -1162,6 +1362,13 @@ int main() {
                 if (!boss.attack.animStarted) {
                     BossPlayOneShot(boss.attack.anim);
                     boss.attack.animStarted = true;
+
+                    if (boss.isHeavyAttack) {
+                        PlaySfxDelayed(gSfxBossHeavy, 0.5f, 1.0f);
+                    }
+                    else {
+                        PlaySfxDelayed(gSfxBossPunch, 0.5f, 0.0f);
+                    }
                 }
 
                 boss.attack.time += deltaTime;
@@ -1187,7 +1394,7 @@ int main() {
                     }
                     else {
                         // ----- Heavy Attack: AOE ทุบลงพื้นรอบตัว -----
-                        float radius = 2.5f;   // ขนาดวงทุบ
+                        float radius = 4.5f;   // ขนาดวงทุบ
                         bossAttackHitbox.center = boss.pos + glm::vec3(0, boss.bodyHitbox.halfExtents.y, 0);
                         bossAttackHitbox.halfExtents = glm::vec3(radius);
                     }
@@ -1255,157 +1462,175 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         // ========== MENU STATE ==========
-    if (gGameState == GameState::Menu) {
-        if (!gPrintedMenuMsg) {
-            std::cout << "=== MAIN MENU ===\n";
-            std::cout << "Press ENTER to Start\n";
-            gPrintedMenuMsg = true;
-        }
+        if (gGameState == GameState::Menu) {
+            if (!gPrintedMenuMsg) {
+                if (gBgmInit) {
+                    ma_sound_stop(&gBgm);
+                }
+                std::cout << "=== MAIN MENU ===\n";
+                std::cout << "Press ENTER to Start\n";
+                gPrintedMenuMsg = true;
+            }
 
-        // Check for ENTER key to start game
-        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
-        if (enterNow && !gPrevEnter) {
-            // "TRY AGAIN" behavior: reset everything and start playing immediately
-            ResetGame();
-            gGameState = GameState::Playing;
-            std::cout << "Retrying: Reset game and starting...\n";
-        }
-        gPrevEnter = enterNow;
+            // Check for ENTER key to start game
+            bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+            if (enterNow && !gPrevEnter) {
+                // "TRY AGAIN" behavior: reset everything and start playing immediately
+                ResetGame();
+                gGameState = GameState::Playing;
+                if (gBgmInit) {
+                    ma_sound_start(&gBgm);
+                }
+                std::cout << "Retrying: Reset game and starting...\n";
+            }
+            gPrevEnter = enterNow;
 
-        // Draw menu UI
-        glDisable(GL_DEPTH_TEST);
-        uiShader->use();
-        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
-        uiShader->setMat4("projection", orthoProj);
+            // Draw menu UI
+            glDisable(GL_DEPTH_TEST);
+            uiShader->use();
+            glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+            uiShader->setMat4("projection", orthoProj);
 
-        // Dark overlay
-        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.02f, 0.02f, 0.03f));
+            // Dark overlay
+            DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.02f, 0.02f, 0.03f));
 
-        // Title background
-        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.15f, 0.05f, 0.05f));
+            // Title background
+            DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.15f, 0.05f, 0.05f));
         
-        // Game title text "DARK ARENA"
-        DrawTextCenteredInBox("DARK ARENA", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.7f, 0.2f));
+            // Game title text "DARK ARENA"
+            DrawTextCenteredInBox("DARK ARENA", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.7f, 0.2f));
         
-        // "Press ENTER" box
-        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.1f, 0.15f));
+            // "Press ENTER" box
+            DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.1f, 0.15f));
 
-        // Pulsing effect for "Press ENTER"
-        float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 3.0f);
-        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.3f + pulse * 0.3f, 0.2f + pulse * 0.2f, 0.1f));
+            // Pulsing effect for "Press ENTER"
+            float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 3.0f);
+            DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.3f + pulse * 0.3f, 0.2f + pulse * 0.2f, 0.1f));
         
-        // "START GAME" text
-        DrawTextCenteredInBox("START GAME", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
+            // "START GAME" text
+            DrawTextCenteredInBox("START GAME", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
 
-        glEnable(GL_DEPTH_TEST);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-        continue; // Skip game logic
-    }
+            glEnable(GL_DEPTH_TEST);
 
-    // ========== GAME OVER STATE ==========
-    if (gGameState == GameState::GameOver) {
-        if (!gPrintedGameOverMsg) {
-            std::cout << "=== GAME OVER ===\n";
-            std::cout << "Press ENTER to Return to Menu\n";
-            gPrintedGameOverMsg = true;
+            UpdateSfxLifetime();
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            continue; // Skip game logic
         }
 
-        // ENTER to retry immediately (behave like START GAME)
-        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
-        if (enterNow && !gPrevEnter) {
-            ResetGame();
-            gGameState = GameState::Playing;
-            std::cout << "Retrying: Reset game and starting...\n";
-        }
-        gPrevEnter = enterNow;
+        // ========== GAME OVER STATE ==========
+        if (gGameState == GameState::GameOver) {
+            if (!gPrintedGameOverMsg) {
+                std::cout << "=== GAME OVER ===\n";
+                std::cout << "Press ENTER to Return to Menu\n";
+                gPrintedGameOverMsg = true;
+            }
 
-        // Draw game over UI
-        glDisable(GL_DEPTH_TEST);
-        uiShader->use();
-        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
-        uiShader->setMat4("projection", orthoProj);
+            // ENTER to retry immediately (behave like START GAME)
+            bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+            if (enterNow && !gPrevEnter) {
+                ResetGame();
+                gGameState = GameState::Playing;
 
-        // Dark red overlay
-        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.1f, 0.01f, 0.01f));
+                if (gBgmInit) {
+                    ma_sound_start(&gBgm);
+                }
+                std::cout << "Retrying: Reset game and starting...\n";
+            }
+            gPrevEnter = enterNow;
 
-        // Game Over title background
-        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.3f, 0.05f, 0.05f));
+            // Draw game over UI
+            glDisable(GL_DEPTH_TEST);
+            uiShader->use();
+            glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+            uiShader->setMat4("projection", orthoProj);
+
+            // Dark red overlay
+            DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.1f, 0.01f, 0.01f));
+
+            // Game Over title background
+            DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.3f, 0.05f, 0.05f));
         
-        // "GAME OVER" text
-        DrawTextCenteredInBox("GAME OVER", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.2f, 0.2f));
+            // "GAME OVER" text
+            DrawTextCenteredInBox("GAME OVER", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.9f, 0.2f, 0.2f));
 
-        // "Press ENTER" box
-        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.15f, 0.05f, 0.05f));
+            // "Press ENTER" box
+            DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.15f, 0.05f, 0.05f));
 
-        // Pulsing effect
-        float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.0f);
-        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.4f + pulse * 0.2f, 0.1f, 0.1f));
+            // Pulsing effect
+            float pulse = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.0f);
+            DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.4f + pulse * 0.2f, 0.1f, 0.1f));
         
-        // "TRY AGAIN" text
-        DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
+            // "TRY AGAIN" text
+            DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.9f, 0.9f, 0.9f));
 
-        glEnable(GL_DEPTH_TEST);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-        continue; // Skip game logic
-    }
-
-    // ========== VICTORY STATE ==========
-    if (gGameState == GameState::Victory) {
-        if (!gPrintedVictoryMsg) {
-            std::cout << "=== VICTORY ===\n";
-            std::cout << "Press ENTER to Play Again\n";
-            gPrintedVictoryMsg = true;
+            glEnable(GL_DEPTH_TEST);
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            continue; // Skip game logic
         }
 
-        // ENTER to restart immediately (same as START)
-        bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
-        if (enterNow && !gPrevEnter) {
-            ResetGame();
-            gGameState = GameState::Playing;
-            std::cout << "Restarting after victory...\n";
+        // ========== VICTORY STATE ==========
+        if (gGameState == GameState::Victory) {
+            if (!gPrintedVictoryMsg) {
+                std::cout << "=== VICTORY ===\n";
+                std::cout << "Press ENTER to Play Again\n";
+                gPrintedVictoryMsg = true;
+            }
+
+            // ENTER to restart immediately (same as START)
+            bool enterNow = glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS;
+            if (enterNow && !gPrevEnter) {
+                ResetGame();
+                gGameState = GameState::Playing;
+                if (gBgmInit) {
+                    ma_sound_start(&gBgm);
+                }
+                std::cout << "Restarting after victory...\n";
+            }
+            gPrevEnter = enterNow;
+
+            // Draw victory UI (greenish)
+            glDisable(GL_DEPTH_TEST);
+            uiShader->use();
+            glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
+            uiShader->setMat4("projection", orthoProj);
+
+            // Dark overlay tinted green
+            DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.05f, 0.08f, 0.02f));
+
+            // Title background
+            DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.07f, 0.20f, 0.05f));
+            // "VICTORY" text
+            DrawTextCenteredInBox("VICTORY", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.95f, 0.95f, 0.6f));
+
+            // "Press ENTER" box
+            DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.16f, 0.08f));
+            // Pulsing effect
+            float pulseV = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.5f);
+            DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.2f + pulseV * 0.2f, 0.25f + pulseV * 0.2f, 0.08f));
+            // "CONTINUE" text
+            DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.95f, 0.95f, 0.95f));
+
+            glEnable(GL_DEPTH_TEST);
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            continue; // Skip game logic
         }
-        gPrevEnter = enterNow;
 
-        // Draw victory UI (greenish)
-        glDisable(GL_DEPTH_TEST);
-        uiShader->use();
-        glm::mat4 orthoProj = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT);
-        uiShader->setMat4("projection", orthoProj);
-
-        // Dark overlay tinted green
-        DrawRect(0, 0, SCR_WIDTH, SCR_HEIGHT, glm::vec3(0.05f, 0.08f, 0.02f));
-
-        // Title background
-        DrawRect(SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, glm::vec3(0.07f, 0.20f, 0.05f));
-        // "VICTORY" text
-        DrawTextCenteredInBox("VICTORY", SCR_WIDTH / 2 - 250, SCR_HEIGHT / 2 + 50, 500, 100, 40, glm::vec3(0.95f, 0.95f, 0.6f));
-
-        // "Press ENTER" box
-        DrawRect(SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, glm::vec3(0.1f, 0.16f, 0.08f));
-        // Pulsing effect
-        float pulseV = 0.5f + 0.5f * std::sin((float)glfwGetTime() * 2.5f);
-        DrawRect(SCR_WIDTH / 2 - 190, SCR_HEIGHT / 2 - 70, 380, 40, glm::vec3(0.2f + pulseV * 0.2f, 0.25f + pulseV * 0.2f, 0.08f));
-        // "CONTINUE" text
-        DrawTextCenteredInBox("TRY AGAIN", SCR_WIDTH / 2 - 200, SCR_HEIGHT / 2 - 80, 400, 60, 28, glm::vec3(0.95f, 0.95f, 0.95f));
-
-        glEnable(GL_DEPTH_TEST);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-        continue; // Skip game logic
-    }
-
-    // camera/projection
-    glm::mat4 projection = glm::perspective(glm::radians(50.0f),
-        (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 300.0f);
-    glm::vec3 camPos; glm::mat4 view;
-    ComputeCamera(camPos, view);
+        // camera/projection
+        glm::mat4 projection = glm::perspective(glm::radians(50.0f),
+            (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 300.0f);
+        glm::vec3 camPos; glm::mat4 view;
+        ComputeCamera(camPos, view);
 
         // ========== ใช้ gShader กับทุกอย่าง  ==========
         gShader->use();
         gShader->setMat4("projection", projection);
         gShader->setMat4("view", view);
+
+
 
         // ---------- 1) วาดพื้น (ไม่มี bone → ใช้ identity) ----------
         glm::mat4 groundModel = glm::mat4(1.0f);
@@ -1435,7 +1660,53 @@ int main() {
         gShader->setMat4("model", playerModel);
         gModel->Draw(*gShader);
 
+
+
+        // ---------- 3) วาดดาบติดมือขวา ----------
+        if (gSwordModel && gSwordShader && gRightHandBoneIndex >= 0) {
+            // 1) bone matrix จาก animator (อยู่ใน local model space)
+            glm::mat4 handBone = playerMats[gRightHandBoneIndex];
+
+            // 2) แปลงเป็น world space: model * bone
+            glm::mat4 handWorld = playerModel * handBone;
+
+            // 3) local offset ของดาบในมือ (ปรับทีหลังได้)
+            glm::mat4 local = glm::mat4(1.0f);
+
+            // เลื่อนจุดเริ่มต้นจากกระดูกนิดหน่อย (ลองเปลี่ยนจนกว่าจะไปแปะที่กำมือ)
+            // ลองเริ่มแบบไม่มี translate ก่อน ถ้าอยากเช็กว่าจุดกระดูกอยู่ตรงไหน:
+            // local = glm::translate(local, glm::vec3(0.0f, 0.0f, 0.0f));
+            local = glm::translate(local, glm::vec3(-90.0f, 160.0f, 0.0f));
+
+            // หมุนให้ดาบเอียงตาม grip มือ (ค่าคร่าว ๆ เอาไว้เริ่ม)
+            //local = glm::rotate(local, glm::radians(-10.0f), glm::vec3(1, 1, 0));
+            local = glm::rotate(local, glm::radians(-20.0f), glm::vec3(0, 0, 1));
+            // ถ้าแกนไม่ตรง ลองขยับสามบรรทัดนี้ทีละแกน
+            // local = glm::rotate(local, glm::radians(180.0f), glm::vec3(0, 1, 0));
+            // local = glm::rotate(local, glm::radians(0.0f),   glm::vec3(1, 0, 0));
+
+            // scale ดาบ
+            local = glm::scale(local, glm::vec3(5.0f));
+
+            // 4) matrix สุดท้ายของดาบ
+            glm::mat4 swordModelMat = handWorld * local;
+
+            // 5) วาดด้วย shader แบบ static
+            gSwordShader->use();
+            gSwordShader->setMat4("projection", projection);
+            gSwordShader->setMat4("view", view);
+            gSwordShader->setMat4("model", swordModelMat);
+
+            gSwordModel->Draw(*gSwordShader);
+        }
+
+
+
+
         // ---------- 4) วาด boss (ใช้ bone ของ boss) ----------
+        gShader->use();
+        gShader->setBool("uUseSkinning", true);
+
         if (!boss.hp.isDead()) {
             auto bossMats = gBossAnimator->GetFinalBoneMatrices();
             for (int i = 0; i < (int)bossMats.size(); ++i)
@@ -1454,12 +1725,9 @@ int main() {
         if (showHitbox) {
             DrawHitbox(playerAttackHitbox);  // hitbox ท่าโจมตีผู้เล่น
             DrawHitbox(bossAttackHitbox);    // hitbox ท่าโจมตีบอส
-            // ถ้าอยากดู hitbox ตัวละครด้วยก็เพิ่มได้:
-            // DrawHitbox(playerHitbox);
-            // DrawHitbox(boss.bodyHitbox);
+            DrawHitbox(playerHitbox);
+            DrawHitbox(boss.bodyHitbox);
         }
-
-
 
         // --- DRAW UI (Health Bars) ---
         glDisable(GL_DEPTH_TEST);
@@ -1520,8 +1788,10 @@ int main() {
     if (groundTex) glDeleteTextures(1, &groundTex);
     if (groundVAO) { glDeleteVertexArrays(1, &groundVAO); glDeleteBuffers(1, &groundVBO); glDeleteBuffers(1, &groundEBO); }
 
-    glfwTerminate();
+    ShutdownAudio();   // <<<<< เพิ่มบรรทัดนี้
+
     return 0;
+
 }
 
 // ---------- Callbacks ----------
@@ -1699,5 +1969,4 @@ void DrawTextUI(const char* text, float x, float y, float size, glm::vec3 color)
         currentX += spacing;
     }
 }
-
 
