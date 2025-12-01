@@ -1089,23 +1089,40 @@ int main() {
             }
             case BossState::Chasing: {
                 if (dist > bossAggroRadius * 1.3f) {
-                    // ผู้เล่นหนีไกลเกิน กลับไป idle
+                    // Player ran away -> back to idle
                     boss.state = BossState::Idle;
                     BossPlayLoop(gBossIdle);
                 }
                 else {
-                    // หันหน้าเข้าหาผู้เล่น
+                    // Face the player
                     if (dist > 0.1f) {
                         boss.yawDeg = glm::degrees(std::atan2(toPlayer3.x, toPlayer3.z));
                     }
 
-                    // เดินเข้าไปจนกว่าจะถึงระยะแบบกว้างสุดของท่าที่มี
+                    // Calculate max attack range (boss should approach until within this)
                     float maxAttackRange = std::max(punchRange, heavyRange);
+
+                    // --- MOVE TOWARDS PLAYER (new) ---
+                    // Stop a little before the max attack range to avoid overshooting.
+                    // Tweak stopFactor if you want the boss to stand closer/further.
+                    const float stopFactor = 0.9f;
+                    float stopDistance = std::max(0.8f, maxAttackRange * stopFactor);
+
+                    if (dist > stopDistance) {
+                        // Move only on XZ plane toward player
+                        glm::vec3 moveDir = glm::normalize(glm::vec3(toPlayer3.x, 0.0f, toPlayer3.z));
+                        if (!glm::any(glm::isnan(moveDir))) {
+                            boss.pos += moveDir * boss.moveSpeed * deltaTime;
+                        }
+                    }
+
+                    // Decide whether an attack can be started
                     bool canPunch = (dist <= punchRange && boss.punchCdTimer <= 0.0f);
                     bool canHeavy = (dist > punchRange && dist <= heavyRange && boss.heavyCdTimer <= 0.0f);
 
                     if (!canPunch && !canHeavy) {
-                        // ทั้งสองท่าอยู่ในคูลดาวน์ → ยังไม่ทำอะไร
+                        // both attacks on cooldown or out of range -> keep chasing/walking
+                        // (we already moved above)
                     }
                     else {
                         bool useHeavy = false;
@@ -1158,7 +1175,7 @@ int main() {
                     break;
                 }
 
-                // ---------- เริ่มเล่นอนิเมชั่นโจมตีจริง ----------
+                // ---------- เริ่มเล่นอนิเมーションโจมตีจริง ----------
                 if (!boss.attack.animStarted) {
                     BossPlayOneShot(boss.attack.anim);
                     boss.attack.animStarted = true;
